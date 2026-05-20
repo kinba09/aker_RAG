@@ -1,8 +1,10 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from sqlalchemy import text
 
+from app.chat import ChatRequest, run_chat
 from app.db import get_engine
 from app.ingest import load_all_files
+from app.models import ChatIn, MODEL_REGISTRY
 
 app = FastAPI(title='Property Scoped Chatbot API')
 
@@ -12,9 +14,14 @@ def health():
     return {'ok': True}
 
 
+@app.get('/models')
+def list_models():
+    return {"models": [m.model_dump() for m in MODEL_REGISTRY]}
+
+
 @app.post('/admin/ingest')
-def ingest_all():
-    return load_all_files()
+def ingest_all(mode: str = Query(default="skip_existing", pattern="^(skip_existing|reload)$")):
+    return load_all_files(mode=mode)
 
 
 @app.get('/properties/{property_code}/kpis')
@@ -38,3 +45,19 @@ def property_kpis(property_code: str, x_property_code: str = Header(default=''))
             {'type': 'kpi_card', 'title': 'Total Balance', 'value': float(r['total_balance'])},
         ],
     }
+
+
+@app.post('/chat')
+def chat(payload: ChatIn, x_property_code: str = Header(default='')):
+    if x_property_code.upper() != payload.property_code.upper():
+        raise HTTPException(status_code=403, detail='Property scope mismatch')
+
+    selected = payload.model_id
+    if selected and selected not in {m.model_id for m in MODEL_REGISTRY}:
+        raise HTTPException(status_code=400, detail=f'Unknown model_id: {selected}')
+
+    return run_chat(ChatRequest(
+        property_code=payload.property_code,
+        question=payload.question,
+        model_id=payload.model_id,
+    ))

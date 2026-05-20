@@ -28,7 +28,7 @@ def _to_float(val):
         return None
 
 
-def load_all_files(data_dir: str | None = None):
+def load_all_files(data_dir: str | None = None, mode: str = "skip_existing"):
     data_dir = data_dir or os.getenv('DATA_DIR', '/data')
     root = Path(data_dir)
     files = sorted(root.glob('*.xls'))
@@ -48,12 +48,24 @@ def load_all_files(data_dir: str | None = None):
             month_year = pd.to_datetime(str(df.iloc[3, 0]).split('=')[-1].strip(), format='%m/%Y').strftime('%Y-%m')
 
             conn.execute(text("INSERT IGNORE INTO properties (property_code, property_name) VALUES (:c,:n)"), {"c": property_code, "n": property_name})
+            existing_snapshot_id = conn.execute(text("""
+                SELECT snapshot_id FROM rent_roll_snapshots
+                WHERE property_code=:c AND month_year=:m AND source_file=:f
+            """), {"c": property_code, "m": month_year, "f": fpath.name}).scalar()
+
+            if existing_snapshot_id and mode == "skip_existing":
+                continue
+
             conn.execute(text("""
                 INSERT INTO rent_roll_snapshots (property_code, as_of_date, month_year, source_file)
                 VALUES (:c,:a,:m,:f)
                 ON DUPLICATE KEY UPDATE snapshot_id=LAST_INSERT_ID(snapshot_id)
             """), {"c": property_code, "a": as_of, "m": month_year, "f": fpath.name})
             snapshot_id = conn.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+
+            if existing_snapshot_id and mode == "reload":
+                conn.execute(text("DELETE FROM rent_roll_unit_charges WHERE snapshot_id=:s"), {"s": snapshot_id})
+                conn.execute(text("DELETE FROM rent_roll_units WHERE snapshot_id=:s"), {"s": snapshot_id})
 
             data = df.iloc[7:].copy()
             data.columns = list('ABCDEFGHIJKLMN')

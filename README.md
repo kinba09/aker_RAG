@@ -44,3 +44,62 @@ docker compose down
 - MySQL schema auto-runs on container init.
 - Data folder is mounted read-only into API container at `/data`.
 - This is the structured-data base; RAG ingestion/retrieval can be added next as another service with metadata filtering on `property_code`.
+
+## New Endpoints (Agentic Router + Model Switch)
+
+List available models:
+```bash
+curl http://localhost:8000/models
+```
+
+Chat (SQL-routed example):
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "X-Property-Code: 115R" \
+  -d '{"property_code":"115R","question":"What is total balance and avg market rent?","model_id":"gpt-4.1-mini"}'
+```
+
+Chat (HYBRID-routed example):
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "X-Property-Code: 115R" \
+  -d '{"property_code":"115R","question":"Give me lease and website highlights for this property","model_id":"gpt-4.1"}'
+```
+
+Notes:
+- Property scoping is enforced by comparing header `X-Property-Code` with payload `property_code`.
+- RAG retrieval is currently a placeholder; SQL path is active.
+
+## Idempotent Ingest Modes
+
+Default (`skip_existing`):
+```bash
+curl -X POST "http://localhost:8000/admin/ingest?mode=skip_existing"
+```
+
+Force reprocess existing snapshots (`reload`):
+```bash
+curl -X POST "http://localhost:8000/admin/ingest?mode=reload"
+```
+
+## Qdrant + LangChain Notes
+
+- Qdrant runs as separate service/container (`property_qdrant`).
+- Unstructured data store remains separate from MySQL.
+- Chat now uses LangChain model adapters:
+  - Google Gemini (`gemini-*`) via `GOOGLE_API_KEY`
+  - Grok (`grok-beta`) via `XAI_API_KEY`
+  - OpenAI/Anthropic kept in registry for future use.
+
+Set env keys using `.env`:
+```bash
+cp .env.example .env
+# edit .env with your real keys
+```
+
+Rebuild after dependency changes:
+```bash
+docker compose up -d --build
+```
