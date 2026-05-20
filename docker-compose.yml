@@ -1,0 +1,40 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: property_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: property_chatbot
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql/001_property_chatbot_schema.sql:/docker-entrypoint-initdb.d/001_property_chatbot_schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: property_api
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: property_chatbot
+      DATA_DIR: /data
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./RentRoll_LeaseCharges_NamesRedacted:/data:ro
+
+volumes:
+  mysql_data:
