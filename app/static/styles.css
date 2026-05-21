@@ -1,0 +1,49 @@
+:root {
+  --bg: #f3faf5;
+  --panel: #ffffff;
+  --panel-2: #f7fcf8;
+  --text: #0f2417;
+  --muted: #587263;
+  --border: #d9ebe0;
+  --accent: #45b36b;
+  --accent-2: #1f8f49;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Inter", "Segoe UI", sans-serif;
+  background: radial-gradient(circle at 20% 10%, #e3f7e8, var(--bg));
+  color: var(--text);
+}
+.app-shell { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+.left-rail {
+  border-right: 1px solid var(--border);
+  background: linear-gradient(180deg, #f6fff8, #eefaf1);
+  padding: 22px;
+}
+.brand { font-weight: 750; font-size: 1.2rem; }
+.sub { color: var(--muted); margin-top: 6px; margin-bottom: 20px; }
+.controls label { display: block; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 0 6px; }
+.controls input, .controls select {
+  width: 100%; border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; background: var(--panel);
+}
+.chat-pane { display: grid; grid-template-rows: auto 1fr auto; }
+.chat-header { padding: 24px 28px 10px; }
+.chat-header h1 { margin: 0; font-size: 1.4rem; }
+.chat-header p { margin: 6px 0 0; color: var(--muted); }
+.messages { padding: 16px 28px; overflow: auto; display: grid; gap: 14px; }
+.msg { max-width: 900px; border: 1px solid var(--border); border-radius: 16px; background: var(--panel); padding: 14px 16px; }
+.msg.user { margin-left: auto; background: #eaf9ef; }
+.msg .meta { font-size: .75rem; color: var(--muted); margin-bottom: 8px; }
+.ui-blocks { margin-top: 12px; display: grid; gap: 10px; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.kpi { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+.kpi .t { font-size: .75rem; color: var(--muted); text-transform: uppercase; }
+.kpi .v { font-size: 1.2rem; font-weight: 700; margin-top: 4px; }
+.table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 12px; }
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); }
+.composer { padding: 14px 24px 24px; border-top: 1px solid var(--border); display: grid; grid-template-columns: 1fr auto; gap: 10px; background: #f8fdf9; }
+textarea { width: 100%; resize: vertical; min-height: 56px; max-height: 180px; border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: inherit; }
+button { border: 0; border-radius: 12px; padding: 12px 18px; background: linear-gradient(180deg, var(--accent), var(--accent-2)); color: white; font-weight: 650; cursor: pointer; }
+@media (max-width: 980px) { .app-shell { grid-template-columns: 1fr; } .left-rail { border-right: 0; border-bottom: 1px solid var(--border); } }

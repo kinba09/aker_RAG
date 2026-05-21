@@ -1,4 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from sqlalchemy import text
@@ -11,6 +14,13 @@ from app.models import ChatIn, MODEL_REGISTRY
 from app.observability import read_recent
 
 app = FastAPI(title='Property Scoped Chatbot API')
+BASE_DIR = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return (BASE_DIR / "templates" / "index.html").read_text(encoding="utf-8")
 
 
 @app.get('/health')
