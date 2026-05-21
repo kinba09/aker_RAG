@@ -1,10 +1,14 @@
 from fastapi import FastAPI, Header, HTTPException, Query
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 from sqlalchemy import text
+import os
 
 from app.chat import ChatRequest, run_chat
 from app.db import get_engine
 from app.ingest import load_all_files
 from app.models import ChatIn, MODEL_REGISTRY
+from app.observability import read_recent
 
 app = FastAPI(title='Property Scoped Chatbot API')
 
@@ -61,3 +65,40 @@ def chat(payload: ChatIn, x_property_code: str = Header(default='')):
         question=payload.question,
         model_id=payload.model_id,
     ))
+
+
+@app.get('/admin/chunks')
+def admin_chunks(
+    property_code: str = Query(..., description="Property code, e.g. 115R"),
+    limit: int = Query(default=20, ge=1, le=200),
+):
+    qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
+    collection = os.getenv("QDRANT_COLLECTION", "property_website_chunks")
+    client = QdrantClient(url=qdrant_url)
+
+    points, _ = client.scroll(
+        collection_name=collection,
+        scroll_filter=Filter(must=[FieldCondition(key="property_code", match=MatchValue(value=property_code.upper()))]),
+        limit=limit,
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    items = []
+    for p in points:
+        payload = p.payload or {}
+        items.append({
+            "id": p.id,
+            "property_code": payload.get("property_code"),
+            "source_url": payload.get("source_url"),
+            "chunk_id": payload.get("chunk_id"),
+            "text_preview": (payload.get("text") or "")[:300],
+            "crawled_at": payload.get("crawled_at"),
+        })
+
+    return {"property_code": property_code.upper(), "count": len(items), "items": items}
+
+
+@app.get('/admin/traces')
+def admin_traces(limit: int = Query(default=100, ge=1, le=1000)):
+    return {"count": limit, "items": read_recent(limit)}

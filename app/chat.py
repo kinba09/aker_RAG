@@ -1,10 +1,13 @@
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from qdrant_client import QdrantClient
@@ -12,6 +15,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue
 from sqlalchemy import text
 
 from app.db import get_engine
+from app.observability import write_trace
 
 
 @dataclass
@@ -31,6 +35,7 @@ class ChatState(TypedDict, total=False):
     answer: str
     citations: list[dict[str, Any]]
     period_applied: str
+    sql_provenance: dict[str, Any]
 
 
 MONTH_MAP = {
@@ -92,6 +97,7 @@ def _route_node(state: ChatState) -> ChatState:
 
 
 def _sql_node(state: ChatState) -> ChatState:
+    t0 = time.perf_counter()
     engine = get_engine()
     period_mode, month_hint = _parse_period(state["question"])
     q = state["question"].lower()
@@ -106,7 +112,9 @@ def _sql_node(state: ChatState) -> ChatState:
                 FROM rent_roll_units
                 WHERE property_code = :property_code
             """), {"property_code": state["property_code"]}).mappings().one()
-            return {"sql_data": dict(row), "period_applied": "all_months"}
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "period_applied": "all_months"}
+            write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": "all_months", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
+            return {"sql_data": dict(row), "period_applied": "all_months", "sql_provenance": prov}
 
         if period_mode == "month":
             latest_year = conn.execute(text("""
@@ -139,7 +147,9 @@ def _sql_node(state: ChatState) -> ChatState:
             total = int(row["total_units"]) if row["total_units"] else 0
             occupied = int(row["occupied_units"]) if row["occupied_units"] else 0
             occupancy = (occupied / total * 100.0) if total else 0.0
-            return {"sql_data": {"sql_kind": "occupancy", "total_units": total, "occupied_units": occupied, "occupancy_pct": occupancy}, "period_applied": ym or "latest"}
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym}
+            write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": ym or "latest", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
+            return {"sql_data": {"sql_kind": "occupancy", "total_units": total, "occupied_units": occupied, "occupancy_pct": occupancy}, "period_applied": ym or "latest", "sql_provenance": prov}
 
         if "vacant" in q:
             rows = conn.execute(text(f"""
@@ -151,7 +161,9 @@ def _sql_node(state: ChatState) -> ChatState:
                 ORDER BY u.unit
                 LIMIT 100
             """), snapshot_params).mappings().all()
-            return {"sql_data": {"sql_kind": "vacant_units", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": ym or "latest"}
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym}
+            write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": ym or "latest", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
+            return {"sql_data": {"sql_kind": "vacant_units", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": ym or "latest", "sql_provenance": prov}
 
         if "expire next month" in q or "expires next month" in q or "leases expire next month" in q:
             rows = conn.execute(text("""
@@ -168,7 +180,9 @@ def _sql_node(state: ChatState) -> ChatState:
                 ORDER BY u.lease_expiration_date, u.unit
                 LIMIT 100
             """), {"property_code": state["property_code"]}).mappings().all()
-            return {"sql_data": {"sql_kind": "expiring_next_month", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": "next_month_from_latest_snapshot"}
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "period_applied": "next_month_from_latest_snapshot"}
+            write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": "next_month_from_latest_snapshot", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
+            return {"sql_data": {"sql_kind": "expiring_next_month", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": "next_month_from_latest_snapshot", "sql_provenance": prov}
 
         row = conn.execute(text("""
             SELECT
@@ -181,26 +195,42 @@ def _sql_node(state: ChatState) -> ChatState:
             WHERE u.property_code = :property_code
               AND s.month_year = :month_year
         """), {"property_code": state["property_code"], "month_year": ym}).mappings().one()
-    return {"sql_data": dict(row), "period_applied": ym or "latest"}
+    prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym}
+    write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": ym or "latest", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
+    return {"sql_data": dict(row), "period_applied": ym or "latest", "sql_provenance": prov}
 
 
 def _rag_node(state: ChatState) -> ChatState:
+    t0 = time.perf_counter()
     url = os.getenv("QDRANT_URL", "http://qdrant:6333")
     collection = os.getenv("QDRANT_COLLECTION", "property_website_chunks")
     client = QdrantClient(url=url)
+    top_k = 6
 
     try:
         _ = client.get_collection(collection_name=collection)
     except Exception:
         return {"rag_data": {"snippets": [], "citations": [], "note": f"Qdrant collection '{collection}' not found yet."}}
 
-    # Retrieval with mandatory property filter.
-    points, _ = client.scroll(
+    provider = os.getenv("EMBEDDING_PROVIDER", "google").lower()
+    if provider == "ollama":
+        embedder = OllamaEmbeddings(
+            model=os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text-v2-moe"),
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434"),
+        )
+    else:
+        embed_model = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/embedding-001")
+        embedder = GoogleGenerativeAIEmbeddings(model=embed_model, google_api_key=os.getenv("GOOGLE_API_KEY"))
+    qvec = embedder.embed_query(state["question"])
+    result = client.query_points(
         collection_name=collection,
-        scroll_filter=Filter(must=[FieldCondition(key="property_code", match=MatchValue(value=state["property_code"]))]),
-        limit=5,
+        query=qvec,
+        query_filter=Filter(must=[FieldCondition(key="property_code", match=MatchValue(value=state["property_code"]))]),
+        limit=top_k,
         with_payload=True,
+        with_vectors=False,
     )
+    points = result.points
 
     snippets = []
     citations = []
@@ -215,9 +245,19 @@ def _rag_node(state: ChatState) -> ChatState:
             "source_url": source_url,
             "chunk_id": chunk_id,
             "property_code": payload.get("property_code", state["property_code"]),
+            "score": getattr(p, "score", None),
         })
 
-    note = "RAG snippets found." if snippets else f"No RAG chunks found for property_code={state['property_code']}."
+    # Keep only useful unique citations
+    uniq = {}
+    for c in citations:
+        key = (c.get("source_url"), c.get("chunk_id"))
+        if key not in uniq:
+            uniq[key] = c
+    citations = list(uniq.values())[:5]
+    snippets = snippets[:5]
+    note = "RAG snippets found via vector search." if snippets else f"No RAG chunks found for property_code={state['property_code']}."
+    write_trace({"event": "rag_node", "property_code": state["property_code"], "retrieved": len(citations), "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
     return {"rag_data": {"snippets": snippets, "citations": citations, "note": note}, "citations": citations}
 
 
@@ -288,6 +328,7 @@ CHAT_GRAPH = _build_graph()
 
 
 def run_chat(req: ChatRequest) -> dict[str, Any]:
+    req_t0 = time.perf_counter()
     initial: ChatState = {
         "property_code": req.property_code.upper(),
         "question": req.question,
@@ -341,6 +382,17 @@ def run_chat(req: ChatRequest) -> dict[str, Any]:
         tools_used.append("sql_kpis")
     if rag_data:
         tools_used.append("rag_retrieve")
+    citations = list(result.get("citations", []))
+    if result.get("sql_provenance"):
+        citations.append(result["sql_provenance"])
+    write_trace({
+        "event": "chat_request",
+        "property_code": result["property_code"],
+        "route": result.get("route", "HYBRID"),
+        "model_id": result["model_id"],
+        "tools_used": tools_used,
+        "latency_ms": round((time.perf_counter()-req_t0)*1000, 2),
+    })
 
     return {
         "property_code": result["property_code"],
@@ -348,7 +400,7 @@ def run_chat(req: ChatRequest) -> dict[str, Any]:
         "model_id": result["model_id"],
         "answer_markdown": result.get("answer", ""),
         "ui_blocks": ui_blocks,
-        "citations": result.get("citations", []),
+        "citations": citations,
         "debug": {"question": result["question"], "tools_used": tools_used},
         "period_applied": result.get("period_applied", "latest"),
     }

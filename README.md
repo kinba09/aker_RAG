@@ -1,140 +1,124 @@
-# Property-Scoped AI Platform (Docker + Pandas)
+# Property-Scoped AI Platform
 
-## What changed
-- Switched ingestion to **Pandas** (`openpyxl` engine).
-- Added **Docker Compose** stack for MySQL + API.
-- Kept strict property scoping in API (`X-Property-Code` must match route property).
-- Added rich response payload shape (`answer_markdown` + `ui_blocks`).
+Backend for property-scoped Q&A where every request is constrained by `property_code` (example: `115R`).
 
-## Files
-- `/docker-compose.yml`
-- `/docker/Dockerfile.api`
-- `/app/main.py`
-- `/app/ingest.py`
-- `/app/db.py`
-- `/app/requirements.txt`
-- `/sql/001_property_chatbot_schema.sql`
+## Architecture
+- Structured data: **MySQL** (`properties`, `rent_roll_snapshots`, `rent_roll_units`, `rent_roll_unit_charges`)
+- Unstructured data: **Qdrant** (`property_website_chunks`)
+- Orchestration: **LangGraph** (`route -> sql -> rag -> synth`)
+- LLM runtime switch: model registry (`/models`)
+- Property guardrails: header/body scope check + SQL filter + Qdrant metadata filter
 
-## Run everything
-From `/Users/abnikahilasamy/Personal_coding/Aker_project`:
+## System Design Diagram
+```mermaid
+flowchart LR
+    U[User / Frontend] --> G[FastAPI]
+    G -->|X-Property-Code + property_code| AG[LangGraph Orchestrator]
 
-1. Start services:
+    AG --> R[Route Node]
+    R -->|SQL| S[SQL Node]
+    R -->|RAG| V[RAG Node]
+    R -->|HYBRID| S
+    S -->|HYBRID continuation| V
+
+    S --> M[(MySQL)]
+    V --> Q[(Qdrant)]
+    V --> F[Filter: property_code == active]
+
+    S --> Y[Synthesis Node]
+    V --> Y
+    Y --> O[answer_markdown + ui_blocks + citations]
+    O --> U
+```
+
+## Features Implemented
+- Idempotent ingestion modes:
+  - `skip_existing` (default)
+  - `reload`
+- Period-aware SQL:
+  - default latest month
+  - month parsing (`May`, `YYYY-MM`)
+  - all-months aggregate
+- Operational SQL intents:
+  - occupancy
+  - vacant units
+  - average rent (KPI)
+  - leases expiring next month
+- Website crawling pipeline (separate from MySQL rent tables)
+- Real vector retrieval in Qdrant with strict `property_code` filter
+- SQL provenance included in citations
+- Backend observability traces (`/admin/traces`)
+- Basic evaluation tests
+
+## Prerequisites
+- Docker + Docker Compose
+- (Optional for local embeddings) Ollama
+
+## Env
+Use `.env` (already supported by `docker-compose`):
+
+```env
+GOOGLE_API_KEY=
+XAI_API_KEY=
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+
+EMBEDDING_PROVIDER=ollama
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+OLLAMA_EMBED_MODEL=nomic-embed-text-v2-moe
+
+GOOGLE_EMBEDDING_MODEL=models/gemini-embedding-001
+```
+
+## Start Services
 ```bash
+cd /Users/abnikahilasamy/Personal_coding/Aker_project
 docker compose up -d --build
 ```
 
-2. Ingest all rent roll files:
-```bash
-curl -X POST http://localhost:8000/admin/ingest
-```
-
-3. Test property-scoped KPI call (`115R`):
-```bash
-curl -H "X-Property-Code: 115R" http://localhost:8000/properties/115R/kpis
-```
-
-If header/code mismatch, API returns `403`.
-
-## Stop
-```bash
-docker compose down
-```
-
-## Notes
-- MySQL schema auto-runs on container init.
-- Data folder is mounted read-only into API container at `/data`.
-- This is the structured-data base; RAG ingestion/retrieval can be added next as another service with metadata filtering on `property_code`.
-
-## New Endpoints (Agentic Router + Model Switch)
-
-List available models:
-```bash
-curl http://localhost:8000/models
-```
-
-Chat (SQL-routed example):
-```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -H "X-Property-Code: 115R" \
-  -d '{"property_code":"115R","question":"What is total balance and avg market rent?","model_id":"gpt-4.1-mini"}'
-```
-
-Chat (HYBRID-routed example):
-```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -H "X-Property-Code: 115R" \
-  -d '{"property_code":"115R","question":"Give me lease and website highlights for this property","model_id":"gpt-4.1"}'
-```
-
-Notes:
-- Property scoping is enforced by comparing header `X-Property-Code` with payload `property_code`.
-- RAG retrieval is currently a placeholder; SQL path is active.
-
-## Idempotent Ingest Modes
-
-Default (`skip_existing`):
+## Ingest Structured Rent-Roll Data
 ```bash
 curl -X POST "http://localhost:8000/admin/ingest?mode=skip_existing"
 ```
 
-Force reprocess existing snapshots (`reload`):
+## Website Source Mapping
+Apply web source table schema:
 ```bash
-curl -X POST "http://localhost:8000/admin/ingest?mode=reload"
+docker exec -i property_mysql mysql -uroot -proot property_chatbot < /Users/abnikahilasamy/Personal_coding/Aker_project/sql/002_property_web_sources.sql
 ```
 
-## Qdrant + LangChain Notes
-
-- Qdrant runs as separate service/container (`property_qdrant`).
-- Unstructured data store remains separate from MySQL.
-- Chat now uses LangChain model adapters:
-  - Google Gemini (`gemini-*`) via `GOOGLE_API_KEY`
-  - Grok (`grok-beta`) via `XAI_API_KEY`
-  - OpenAI/Anthropic kept in registry for future use.
-
-Set env keys using `.env`:
+Load property website mapping CSV:
 ```bash
-cp .env.example .env
-# edit .env with your real keys
+docker cp /Users/abnikahilasamy/Personal_coding/Aker_project/property_sites.csv property_api:/tmp/property_sites.csv
+
+docker exec -it property_api python /app/scripts/discover_property_sites.py \
+  --csv /tmp/property_sites.csv \
+  --host mysql --port 3306 --user root --password root --database property_chatbot
 ```
 
-Rebuild after dependency changes:
+## Crawl + Index Website Chunks
 ```bash
-docker compose up -d --build
+docker exec -it property_api python /app/scripts/crawl_property_sites.py \
+  --db-host mysql --db-port 3306 --db-user root --db-password root --db-name property_chatbot \
+  --qdrant-url http://qdrant:6333 \
+  --collection property_website_chunks \
+  --max-depth 1 \
+  --max-pages 5 \
+  --reindex
 ```
 
-## System Design Diagram
-
-```mermaid
-flowchart LR
-    U[User / Frontend] --> G[API Gateway / FastAPI]
-    G -->|property_code scoped request| AG[LangGraph Orchestrator]
-
-    AG --> R[Route Node]
-    R -->|SQL| S[SQL Tool Node]
-    R -->|RAG| V[RAG Tool Node]
-    R -->|HYBRID| S
-    S -->|HYBRID continuation| V
-
-    S --> M[(MySQL Structured DB)]
-    V --> Q[(Qdrant Unstructured Vector DB)]
-    V -->|metadata filter| F[Filter property_code == active property]
-
-    S --> Y[Synthesis Node]
-    V --> Y
-    Y --> O[Rich Response: answer_markdown + ui_blocks + citations]
-    O --> U
-```
-
-## Graph + RAG Test
-
-Rebuild:
+## API Quick Tests
+Health:
 ```bash
-docker compose up -d --build
+curl http://localhost:8000/health
 ```
 
-Chat using LangGraph flow:
+Models:
+```bash
+curl http://localhost:8000/models
+```
+
+Chat (hybrid):
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
@@ -142,7 +126,23 @@ curl -X POST http://localhost:8000/chat \
   -d '{"property_code":"115R","question":"Give me KPI summary and website highlights","model_id":"gemini-3.1-flash-lite"}'
 ```
 
-Notes:
-- Route node picks SQL/RAG/HYBRID.
-- RAG retrieval now performs a Qdrant query with payload filter `property_code=<active_property_code>`.
-- If graph/LLM fails, API returns deterministic fallback response.
+Chunk preview UI endpoint:
+```bash
+curl "http://localhost:8000/admin/chunks?property_code=115R&limit=20"
+```
+
+Observability traces endpoint:
+```bash
+curl "http://localhost:8000/admin/traces?limit=50"
+```
+
+## Evaluation (Basic)
+Run tests in container:
+```bash
+docker cp /Users/abnikahilasamy/Personal_coding/Aker_project/tests property_api:/app/tests
+docker exec -it property_api python -m pytest /app/tests -q
+```
+
+## Notes
+- Keep `.env`, raw XLS files, and local mapping CSV out of Git.
+- RAG quality depends on crawl quality and embedding coverage.
