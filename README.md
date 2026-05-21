@@ -103,3 +103,46 @@ Rebuild after dependency changes:
 ```bash
 docker compose up -d --build
 ```
+
+## System Design Diagram
+
+```mermaid
+flowchart LR
+    U[User / Frontend] --> G[API Gateway / FastAPI]
+    G -->|property_code scoped request| AG[LangGraph Orchestrator]
+
+    AG --> R[Route Node]
+    R -->|SQL| S[SQL Tool Node]
+    R -->|RAG| V[RAG Tool Node]
+    R -->|HYBRID| S
+    S -->|HYBRID continuation| V
+
+    S --> M[(MySQL Structured DB)]
+    V --> Q[(Qdrant Unstructured Vector DB)]
+    V -->|metadata filter| F[Filter property_code == active property]
+
+    S --> Y[Synthesis Node]
+    V --> Y
+    Y --> O[Rich Response: answer_markdown + ui_blocks + citations]
+    O --> U
+```
+
+## Graph + RAG Test
+
+Rebuild:
+```bash
+docker compose up -d --build
+```
+
+Chat using LangGraph flow:
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "X-Property-Code: 115R" \
+  -d '{"property_code":"115R","question":"Give me KPI summary and website highlights","model_id":"gemini-3.1-flash-lite"}'
+```
+
+Notes:
+- Route node picks SQL/RAG/HYBRID.
+- RAG retrieval now performs a Qdrant query with payload filter `property_code=<active_property_code>`.
+- If graph/LLM fails, API returns deterministic fallback response.
