@@ -43,6 +43,11 @@ body {
 .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 12px; }
 table { width: 100%; border-collapse: collapse; font-size: .9rem; }
 th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); }
+.citations { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.citations-title { font-size: .78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+.citations-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: .86rem; color: #2f4d3e; }
+.citations-list a { color: #1f8f49; text-decoration: none; }
+.citations-list a:hover { text-decoration: underline; }
 .composer { padding: 14px 24px 24px; border-top: 1px solid var(--border); display: grid; grid-template-columns: 1fr auto; gap: 10px; background: #f8fdf9; }
 textarea { width: 100%; resize: vertical; min-height: 56px; max-height: 180px; border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: inherit; }
 button { border: 0; border-radius: 12px; padding: 12px 18px; background: linear-gradient(180deg, var(--accent), var(--accent-2)); color: white; font-weight: 650; cursor: pointer; }

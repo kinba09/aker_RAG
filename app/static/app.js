@@ -37,8 +37,49 @@ function addMessage(role, markdown, extra = {}) {
     wrap.appendChild(renderUiBlocks(extra.ui_blocks));
   }
 
+  if (role !== 'user' && extra.citations && Array.isArray(extra.citations) && extra.citations.length) {
+    wrap.appendChild(renderCitations(extra.citations));
+  }
+
   messagesEl.appendChild(wrap);
   messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function renderCitations(citations) {
+  const root = document.createElement('div');
+  root.className = 'citations';
+  const title = document.createElement('div');
+  title.className = 'citations-title';
+  title.textContent = 'Sources';
+  root.appendChild(title);
+
+  const list = document.createElement('ul');
+  list.className = 'citations-list';
+
+  citations.forEach((c) => {
+    const li = document.createElement('li');
+    if (c.source_type === 'mysql_snapshot') {
+      const month = c.month_year || c.period_applied || 'n/a';
+      const mode = c.sql_mode || 'deterministic';
+      li.textContent = `SQL (${mode}) • property=${c.property_code || 'n/a'} • period=${month}`;
+    } else if (c.source_url) {
+      const a = document.createElement('a');
+      a.href = c.source_url;
+      a.target = '_blank';
+      a.rel = 'noreferrer noopener';
+      a.textContent = c.source_url;
+      li.appendChild(a);
+      const meta = document.createElement('span');
+      meta.textContent = ` • chunk=${c.chunk_id || 'n/a'}${c.score != null ? ` • score=${Number(c.score).toFixed(3)}` : ''}`;
+      li.appendChild(meta);
+    } else {
+      li.textContent = JSON.stringify(c);
+    }
+    list.appendChild(li);
+  });
+
+  root.appendChild(list);
+  return root;
 }
 
 function renderUiBlocks(blocks) {

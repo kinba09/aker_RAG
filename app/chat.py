@@ -17,6 +17,13 @@ from sqlalchemy import text
 from app.db import get_engine
 from app.observability import write_trace
 
+SQL_SCHEMA_CONTEXT = """
+Tables:
+- rent_roll_snapshots(snapshot_id, property_code, as_of_date, month_year, source_file)
+- rent_roll_units(unit_row_id, snapshot_id, property_code, unit, unit_type, unit_sq_ft, resident_id, resident_name, market_rent, resident_deposit, other_deposit, move_in_date, lease_expiration_date, move_out_date, balance)
+- rent_roll_unit_charges(charge_row_id, unit_row_id, snapshot_id, property_code, charge_code, amount, is_total)
+"""
+
 
 @dataclass
 class ChatRequest:
@@ -70,6 +77,17 @@ def _parse_period(question: str) -> tuple[str, str | None]:
     return ("latest", None)
 
 
+def _parse_unit_hint(question: str) -> str | None:
+    q = question.upper()
+    m = re.search(r"\bUNIT\s+([A-Z0-9-]+)\b", q)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b([A-Z]\d{2,4}[A-Z]?)\b", q)
+    if m:
+        return m.group(1)
+    return None
+
+
 def _build_llm(model_id: str):
     if model_id.startswith("gemini"):
         return ChatGoogleGenerativeAI(model=model_id, temperature=0)
@@ -94,6 +112,42 @@ def _route_node(state: ChatState) -> ChatState:
     else:
         route = "HYBRID"
     return {"route": route}
+
+
+def _unit_field_column(field: str) -> str | None:
+    mapping = {
+        "sq_ft": "unit_sq_ft",
+        "move_in_date": "move_in_date",
+        "lease_expiration_date": "lease_expiration_date",
+        "balance": "balance",
+        "market_rent": "market_rent",
+    }
+    return mapping.get(field)
+
+
+def _sql_kind_for_question(question: str, unit_hint: str | None) -> str:
+    q = question.lower()
+    if "occupancy" in q:
+        return "occupancy"
+    if "vacant" in q:
+        return "vacant_units"
+    if "highest balance" in q or "top balance" in q or "delinquen" in q or "past due" in q:
+        return "highest_balances"
+    if re.search(r"\blease(?:s)?\s+(?:expire|expires|expiring|expiration)\s+next\s+month\b", q) or re.search(r"\b(?:expire|expires|expiring|expiration)\s+next\s+month\b", q):
+        return "expiring_next_month"
+    if "expire" in q and "month" in q:
+        return "expiring_in_month"
+    if "charge" in q:
+        return "lease_charges"
+    if "deposit" in q:
+        return "deposits"
+    if "rent by unit" in q or ("rent" in q and "unit" in q and not unit_hint):
+        return "rent_by_unit"
+    if unit_hint and any(k in q for k in ["sq ft", "sqft", "square feet", "square footage", "move in", "lease expiration", "market rent", "balance"]):
+        return "unit_field"
+    if unit_hint:
+        return "unit_detail"
+    return "kpi_summary"
 
 
 def _sql_node(state: ChatState) -> ChatState:
@@ -134,8 +188,38 @@ def _sql_node(state: ChatState) -> ChatState:
 
         snapshot_filter = "u.property_code = :property_code AND s.month_year = :month_year"
         snapshot_params = {"property_code": state["property_code"], "month_year": ym}
+        unit_hint = _parse_unit_hint(state["question"])
 
-        if "occupancy" in q:
+        sql_kind = _sql_kind_for_question(state["question"], unit_hint)
+        write_trace({"event": "sql_intent_classified", "property_code": state["property_code"], "sql_kind": sql_kind})
+
+        if sql_kind == "unit_field" and unit_hint:
+            field = None
+            ql = q
+            if any(k in ql for k in ["sq ft", "sqft", "square feet", "square footage"]):
+                field = "sq_ft"
+            elif "move in" in ql:
+                field = "move_in_date"
+            elif "lease expiration" in ql or "lease expire" in ql:
+                field = "lease_expiration_date"
+            elif "market rent" in ql:
+                field = "market_rent"
+            elif "balance" in ql:
+                field = "balance"
+            col = _unit_field_column(field or "")
+            if col:
+                row_field = conn.execute(text(f"""
+                    SELECT u.unit, u.{col} AS value, s.month_year
+                    FROM rent_roll_units u
+                    JOIN rent_roll_snapshots s ON s.snapshot_id = u.snapshot_id
+                    WHERE {snapshot_filter}
+                      AND UPPER(u.unit) = :unit
+                    LIMIT 1
+                """), {**snapshot_params, "unit": unit_hint}).mappings().first()
+                prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym, "sql_kind": "unit_field", "row_count": 1 if row_field else 0}
+                return {"sql_data": {"sql_kind": "unit_field", "unit": unit_hint, "field": field, "value": (row_field["value"] if row_field else None), "month_year": ym}, "period_applied": ym or "latest", "sql_provenance": prov}
+
+        if sql_kind == "occupancy":
             row = conn.execute(text(f"""
                 SELECT
                     COUNT(*) AS total_units,
@@ -151,13 +235,14 @@ def _sql_node(state: ChatState) -> ChatState:
             write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": ym or "latest", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
             return {"sql_data": {"sql_kind": "occupancy", "total_units": total, "occupied_units": occupied, "occupancy_pct": occupancy}, "period_applied": ym or "latest", "sql_provenance": prov}
 
-        if "vacant" in q:
+        if sql_kind == "vacant_units":
             rows = conn.execute(text(f"""
                 SELECT u.unit, u.unit_type, u.market_rent, u.balance
                 FROM rent_roll_units u
                 JOIN rent_roll_snapshots s ON s.snapshot_id = u.snapshot_id
                 WHERE {snapshot_filter}
                   AND (u.resident_id IS NULL OR u.resident_id = '')
+                  AND u.unit NOT IN ('Future Residents/Applicants','Total Non Rev Units')
                 ORDER BY u.unit
                 LIMIT 100
             """), snapshot_params).mappings().all()
@@ -165,7 +250,7 @@ def _sql_node(state: ChatState) -> ChatState:
             write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": ym or "latest", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
             return {"sql_data": {"sql_kind": "vacant_units", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": ym or "latest", "sql_provenance": prov}
 
-        if "expire next month" in q or "expires next month" in q or "leases expire next month" in q:
+        if sql_kind == "expiring_next_month":
             rows = conn.execute(text("""
                 SELECT u.unit, u.resident_name, s.month_year, u.lease_expiration_date
                 FROM rent_roll_units u
@@ -184,6 +269,81 @@ def _sql_node(state: ChatState) -> ChatState:
             write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": "next_month_from_latest_snapshot", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
             return {"sql_data": {"sql_kind": "expiring_next_month", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": "next_month_from_latest_snapshot", "sql_provenance": prov}
 
+        if sql_kind == "expiring_in_month":
+            rows = conn.execute(text(f"""
+                SELECT u.unit, u.resident_name, u.lease_expiration_date
+                FROM rent_roll_units u
+                JOIN rent_roll_snapshots s ON s.snapshot_id = u.snapshot_id
+                WHERE {snapshot_filter}
+                  AND DATE_FORMAT(u.lease_expiration_date, '%Y-%m') = :month_year
+                ORDER BY u.lease_expiration_date, u.unit
+                LIMIT 100
+            """), snapshot_params).mappings().all()
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym, "sql_kind": "expiring_in_month", "row_count": len(rows)}
+            return {"sql_data": {"sql_kind": "expiring_in_month", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": ym or "latest", "sql_provenance": prov}
+
+        if sql_kind == "highest_balances":
+            rows = conn.execute(text(f"""
+                SELECT u.unit, u.resident_name, u.balance, u.market_rent
+                FROM rent_roll_units u
+                JOIN rent_roll_snapshots s ON s.snapshot_id = u.snapshot_id
+                WHERE {snapshot_filter}
+                ORDER BY u.balance DESC, u.unit
+                LIMIT 25
+            """), snapshot_params).mappings().all()
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym, "sql_kind": "highest_balances", "row_count": len(rows)}
+            return {"sql_data": {"sql_kind": "highest_balances", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": ym or "latest", "sql_provenance": prov}
+
+        if sql_kind == "unit_detail" and unit_hint:
+            row = conn.execute(text(f"""
+                SELECT u.unit, u.unit_type, u.unit_sq_ft, u.resident_id, u.resident_name, u.market_rent, u.resident_deposit, u.other_deposit, u.move_in_date, u.lease_expiration_date, u.balance
+                FROM rent_roll_units u
+                JOIN rent_roll_snapshots s ON s.snapshot_id = u.snapshot_id
+                WHERE {snapshot_filter}
+                  AND UPPER(u.unit) = :unit
+                LIMIT 1
+            """), {**snapshot_params, "unit": unit_hint}).mappings().first()
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym, "sql_kind": "unit_detail", "row_count": 1 if row else 0}
+            return {"sql_data": {"sql_kind": "unit_detail", "rows": ([dict(row)] if row else []), "count": 1 if row else 0}, "period_applied": ym or "latest", "sql_provenance": prov}
+
+        if sql_kind == "rent_by_unit":
+            rows = conn.execute(text(f"""
+                SELECT u.unit, u.unit_type, u.market_rent
+                FROM rent_roll_units u
+                JOIN rent_roll_snapshots s ON s.snapshot_id = u.snapshot_id
+                WHERE {snapshot_filter}
+                ORDER BY u.unit
+                LIMIT 100
+            """), snapshot_params).mappings().all()
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym, "sql_kind": "rent_by_unit", "row_count": len(rows)}
+            return {"sql_data": {"sql_kind": "rent_by_unit", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": ym or "latest", "sql_provenance": prov}
+
+        if sql_kind == "deposits":
+            rows = conn.execute(text(f"""
+                SELECT u.unit, u.resident_name, u.resident_deposit, u.other_deposit
+                FROM rent_roll_units u
+                JOIN rent_roll_snapshots s ON s.snapshot_id = u.snapshot_id
+                WHERE {snapshot_filter}
+                ORDER BY u.unit
+                LIMIT 100
+            """), snapshot_params).mappings().all()
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym, "sql_kind": "deposits", "row_count": len(rows)}
+            return {"sql_data": {"sql_kind": "deposits", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": ym or "latest", "sql_provenance": prov}
+
+        if sql_kind == "lease_charges":
+            rows = conn.execute(text(f"""
+                SELECT u.unit, u.resident_name, c.charge_code, c.amount, c.is_total
+                FROM rent_roll_unit_charges c
+                JOIN rent_roll_units u ON u.unit_row_id = c.unit_row_id
+                JOIN rent_roll_snapshots s ON s.snapshot_id = c.snapshot_id
+                WHERE c.property_code = :property_code
+                  AND s.month_year = :month_year
+                ORDER BY u.unit, c.charge_code
+                LIMIT 200
+            """), snapshot_params).mappings().all()
+            prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym, "sql_kind": "lease_charges", "row_count": len(rows)}
+            return {"sql_data": {"sql_kind": "lease_charges", "rows": [dict(r) for r in rows], "count": len(rows)}, "period_applied": ym or "latest", "sql_provenance": prov}
+
         row = conn.execute(text("""
             SELECT
                 COUNT(*) AS units,
@@ -195,8 +355,9 @@ def _sql_node(state: ChatState) -> ChatState:
             WHERE u.property_code = :property_code
               AND s.month_year = :month_year
         """), {"property_code": state["property_code"], "month_year": ym}).mappings().one()
-    prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym}
-    write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": ym or "latest", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
+
+    prov = {"source_type": "mysql_snapshot", "property_code": state["property_code"], "month_year": ym, "sql_kind": "kpi_summary", "row_count": 1}
+    write_trace({"event": "sql_node", "property_code": state["property_code"], "period_applied": ym or "latest", "sql_mode": "fallback_deterministic", "latency_ms": round((time.perf_counter()-t0)*1000, 2)})
     return {"sql_data": dict(row), "period_applied": ym or "latest", "sql_provenance": prov}
 
 
@@ -264,6 +425,18 @@ def _rag_node(state: ChatState) -> ChatState:
 def _synth_node(state: ChatState) -> ChatState:
     sql_data = state.get("sql_data")
     rag_data = state.get("rag_data")
+    if sql_data:
+        kind = sql_data.get("sql_kind", "kpis")
+        if kind == "unit_field":
+            field = sql_data.get("field")
+            value = sql_data.get("value")
+            unit = sql_data.get("unit")
+            month = sql_data.get("month_year")
+            if value is None:
+                return {"answer": f"No {field} row found for unit {unit} in {month}."}
+            return {"answer": f"Unit {unit} {field} for {month}: {value}."}
+        if kind in {"vacant_units", "expiring_next_month", "expiring_in_month", "highest_balances", "unit_detail", "rent_by_unit", "deposits", "lease_charges"}:
+            return {"answer": f"Found {int(sql_data.get('count', 0))} rows."}
 
     context_lines = [
         f"Route: {state['route']}",
@@ -271,7 +444,9 @@ def _synth_node(state: ChatState) -> ChatState:
         f"Question: {state['question']}",
     ]
     if sql_data:
-        context_lines.append(f"SQL KPIs: {sql_data}")
+        kind = sql_data.get("sql_kind", "kpis")
+        context_lines.append(f"SQL result kind: {kind}")
+        context_lines.append(f"Deterministic SQL result: {sql_data}")
     if rag_data:
         context_lines.append(f"RAG note: {rag_data.get('note', '')}")
         if rag_data.get("snippets"):
@@ -280,7 +455,7 @@ def _synth_node(state: ChatState) -> ChatState:
     try:
         llm = _build_llm(state["model_id"])
         msg = llm.invoke([
-            SystemMessage(content="You are a property analytics assistant. Only answer within the provided property scope. Keep response concise."),
+            SystemMessage(content="You are a property analytics assistant. Only answer within the provided property scope. Keep response concise. Do not write SQL queries. Do not invent table names or columns. Only summarize the deterministic sql_data provided."),
             HumanMessage(content="\n".join(context_lines)),
         ])
         answer = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -355,13 +530,19 @@ def run_chat(req: ChatRequest) -> dict[str, Any]:
     ui_blocks = []
     if sql_data:
         kind = sql_data.get("sql_kind", "kpis")
-        if kind == "occupancy":
+        if kind == "unit_field":
+            ui_blocks.extend([
+                {"type": "kpi_card", "title": "Unit", "value": sql_data.get("unit")},
+                {"type": "kpi_card", "title": str(sql_data.get("field", "Field")), "value": sql_data.get("value") if sql_data.get("value") is not None else "Not found"},
+                {"type": "kpi_card", "title": "Period", "value": sql_data.get("month_year")},
+            ])
+        elif kind == "occupancy":
             ui_blocks.extend([
                 {"type": "kpi_card", "title": "Occupancy %", "value": round(float(sql_data["occupancy_pct"]), 2)},
                 {"type": "kpi_card", "title": "Occupied Units", "value": int(sql_data["occupied_units"])},
                 {"type": "kpi_card", "title": "Total Units", "value": int(sql_data["total_units"])},
             ])
-        elif kind in {"vacant_units", "expiring_next_month"}:
+        elif kind in {"vacant_units", "expiring_next_month", "expiring_in_month", "highest_balances", "unit_detail", "rent_by_unit", "deposits", "lease_charges"}:
             rows = sql_data.get("rows", [])
             columns = list(rows[0].keys()) if rows else []
             values = [[r.get(c) for c in columns] for r in rows]

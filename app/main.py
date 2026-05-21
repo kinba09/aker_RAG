@@ -46,9 +46,13 @@ def property_kpis(property_code: str, x_property_code: str = Header(default=''))
     engine = get_engine()
     with engine.begin() as conn:
         r = conn.execute(text("""
-            SELECT COUNT(*) AS units, COALESCE(SUM(balance),0) AS total_balance
-            FROM rent_roll_units
-            WHERE property_code = :property_code
+            SELECT COUNT(*) AS units, COALESCE(SUM(u.balance),0) AS total_balance
+            FROM rent_roll_units u
+            JOIN rent_roll_snapshots s ON s.snapshot_id = u.snapshot_id
+            WHERE u.property_code = :property_code
+              AND s.month_year = (
+                SELECT MAX(month_year) FROM rent_roll_snapshots WHERE property_code = :property_code
+              )
         """), {"property_code": property_code.upper()}).mappings().one()
 
     return {
