@@ -43,3 +43,15 @@ def test_sql_intent_lease_variant_ending():
 
 def test_sql_intent_lease_variant_upcoming():
     assert sql_intent("upcoming lease expirations", None) == "expiring_next_month"
+
+
+def test_sql_intent_renewals_due_soon():
+    assert sql_intent("renewals due soon", None) == "expiring_next_month"
+
+
+def test_sql_intent_moving_out_soon():
+    assert sql_intent("who is moving out soon", None) == "expiring_next_month"
+
+
+def test_sql_intent_owing_more_than():
+    assert sql_intent("residents owing more than 500", None) == "highest_balances"

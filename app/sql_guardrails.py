@@ -12,6 +12,7 @@ ALLOWED_SCHEMA: dict[str, set[str]] = {
         "unit",
         "unit_type",
         "unit_sq_ft",
+        "resident_id",
         "resident_name",
         "market_rent",
         "resident_deposit",
@@ -73,10 +74,14 @@ def validate_generated_sql(sql: str, max_limit: int = 200) -> ValidationResult:
         return ValidationResult(False, "System schemas are not allowed")
     if re.search(r"\bselect\s+\*", low):
         return ValidationResult(False, "SELECT * is not allowed")
+    if re.search(r"\bor\s+1\s*=\s*1\b", low):
+        return ValidationResult(False, "Unsafe OR condition is not allowed")
     if ":property_code" not in normalized:
         return ValidationResult(False, "Query must use bound parameter :property_code")
     if re.search(r"\bproperty_code\s*=\s*['\"][^'\"]+['\"]", normalized, flags=re.IGNORECASE):
         return ValidationResult(False, "property_code cannot be hard-coded")
+    if not re.search(r"\b(?:u|s|c|rent_roll_units|rent_roll_snapshots|rent_roll_unit_charges)\.property_code\s*=\s*:property_code\b", normalized, flags=re.IGNORECASE):
+        return ValidationResult(False, "Query must include a real table property_code filter bound to :property_code")
 
     for kw in BANNED_KEYWORDS:
         if re.search(rf"\b{kw}\b", low):

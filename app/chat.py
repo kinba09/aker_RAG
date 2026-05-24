@@ -70,12 +70,16 @@ def _build_llm(model_id: str):
 def _route_node(state: ChatState) -> ChatState:
     q = state["question"].lower()
     rag_intent = any(k in q for k in ["website", "amenities", "neighborhood", "school", "map", "highlight", "page", "content"])
-    sql_intent = any(k in q for k in ["balance", "rent", "deposit", "lease", "unit", "charge", "occupancy", "kpi", "summary", "delinquen"])
-    if rag_intent and sql_intent:
+    unit_hint = parse_unit_hint(state["question"])
+    planner_intent = sql_intent(state["question"], unit_hint)
+    keyword_sql_signal = any(k in q for k in ["balance", "rent", "deposit", "lease", "unit", "charge", "occupancy", "kpi", "summary", "delinquen"])
+    has_sql_signal = planner_intent != "llm_sql_fallback" or keyword_sql_signal
+
+    if rag_intent and has_sql_signal:
         return {"route": "HYBRID"}
     if rag_intent:
         return {"route": "RAG"}
-    if sql_intent:
+    if has_sql_signal:
         return {"route": "SQL"}
     return {"route": "HYBRID"}
 
@@ -588,7 +592,7 @@ def _synth_node(state: ChatState) -> ChatState:
         if sql_data.get("sql_kind") == "occupancy":
             return {"answer": f"Occupancy is {round(float(sql_data.get('occupancy_pct', 0.0)), 2)}% ({sql_data.get('occupied_units')}/{sql_data.get('total_units')}) for {sql_data.get('period_applied')}."}
         if sql_data.get("row_count") is not None:
-            return {"answer": f"Found {int(sql_data.get('row_count', 0))} rows."}
+            return {"answer": f"Found {int(sql_data.get('row_count', 0))} records for {sql_data.get('period_applied')}. The table below contains the matching rows."}
         return {"answer": "Structured SQL result ready."}
 
     context_lines = [
@@ -608,12 +612,21 @@ def _synth_node(state: ChatState) -> ChatState:
         msg = llm.invoke(
             [
                 SystemMessage(
-                    content="Do not write SQL queries. Do not invent table names, columns, rows, metrics, or values. Only summarize the deterministic or validated SQL result provided."
+                    content=(
+                        "You are a reporting assistant.\n"
+                        "Hard rules:\n"
+                        "- Never output SQL, pseudo-SQL, code blocks, or query fragments.\n"
+                        "- Never invent table names, columns, rows, metrics, or values.\n"
+                        "- Only summarize provided deterministic SQL output and RAG snippets.\n"
+                        "- If SQL data is missing, say that structured SQL could not be executed safely."
+                    )
                 ),
                 HumanMessage(content="\n".join(context_lines)),
             ]
         )
         answer = msg.content if isinstance(msg.content, str) else str(msg.content)
+        if re.search(r"```(?:sql)?|\bselect\b.+\bfrom\b|\bwhere\b.+\b(property_code|month_year)\b", answer, flags=re.IGNORECASE | re.DOTALL):
+            answer = "Structured results are summarized above. SQL text is intentionally not exposed."
     except Exception as e:
         answer = f"Route: **{state['route']}**. Property scope enforced for **{state['property_code']}**. LLM call not executed: {e}"
     return {"answer": answer}

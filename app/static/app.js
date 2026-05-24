@@ -58,9 +58,9 @@ function renderCitations(citations) {
 
   citations.forEach((c) => {
     const li = document.createElement('li');
-    if (c.source_type === 'mysql_snapshot') {
+    if (c.source_type === 'sql' || c.source_type === 'mysql_snapshot') {
       const month = c.month_year || c.period_applied || 'n/a';
-      const mode = c.sql_mode || 'deterministic';
+      const mode = c.query_source || c.sql_mode || 'deterministic';
       li.textContent = `SQL (${mode}) • property=${c.property_code || 'n/a'} • period=${month}`;
     } else if (c.source_url) {
       const a = document.createElement('a');

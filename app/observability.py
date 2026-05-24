@@ -1,8 +1,9 @@
 import json
+import os
 import time
 from pathlib import Path
 
-LOG_PATH = Path('/app/logs/traces.jsonl')
+LOG_PATH = Path(os.getenv("TRACE_LOG_PATH", "logs/traces.jsonl"))
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 

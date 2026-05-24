@@ -21,5 +21,4 @@ MODEL_REGISTRY = [
     ModelInfo(model_id="grok-beta", provider="xai", supports_tools=True),
     ModelInfo(model_id="gpt-4.1-mini", provider="openai", supports_tools=True),
     ModelInfo(model_id="gpt-4.1", provider="openai", supports_tools=True),
-    ModelInfo(model_id="claude-3-5-sonnet", provider="anthropic", supports_tools=True),
 ]

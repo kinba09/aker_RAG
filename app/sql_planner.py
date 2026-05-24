@@ -56,6 +56,10 @@ def sql_intent(question: str, unit_hint: str | None) -> str:
         return "highest_balances"
     if re.search(r"\b(?:lease(?:s)?\s+)?(?:expire|expires|expiring|ending|expiration|expirations)\s+next\s+month\b", q) or "upcoming lease expiration" in q:
         return "expiring_next_month"
+    if "renewals due soon" in q or "moving out soon" in q or "who is moving out soon" in q:
+        return "expiring_next_month"
+    if re.search(r"\bowing more than\b", q):
+        return "highest_balances"
     if ("expire" in q or "expiration" in q or "expiring" in q) and "month" in q:
         return "expiring_in_month"
     if "charge" in q:

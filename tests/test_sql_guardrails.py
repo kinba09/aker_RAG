@@ -6,12 +6,21 @@ def test_sql_validator_rejects_fake_table():
         "SELECT l.lease_id FROM leases l WHERE l.property_code = :property_code LIMIT 10"
     )
     assert not r.ok
+    assert ("Disallowed table" in r.reason) or ("real table property_code filter" in r.reason)
 
 
 def test_sql_validator_requires_property_code_param():
     r = validate_generated_sql("SELECT u.unit FROM rent_roll_units u LIMIT 10")
     assert not r.ok
     assert ":property_code" in r.reason
+
+
+def test_sql_validator_rejects_missing_real_property_filter():
+    r = validate_generated_sql(
+        "SELECT u.unit, u.balance FROM rent_roll_units u WHERE u.balance > 0 AND :property_code IS NOT NULL LIMIT 10"
+    )
+    assert not r.ok
+    assert "real table property_code filter" in r.reason
 
 
 def test_sql_validator_rejects_select_star():
@@ -33,6 +42,14 @@ def test_sql_validator_requires_limit():
         "SELECT u.unit FROM rent_roll_units u WHERE u.property_code = :property_code"
     )
     assert not r.ok
+
+
+def test_sql_validator_rejects_unsafe_or_condition():
+    r = validate_generated_sql(
+        "SELECT u.unit FROM rent_roll_units u WHERE u.property_code = :property_code OR 1=1 LIMIT 10"
+    )
+    assert not r.ok
+    assert "Unsafe OR condition" in r.reason
 
 
 def test_sql_validator_accepts_bound_property_code():

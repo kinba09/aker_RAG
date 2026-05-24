@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS rent_roll_snapshots (
   month_year CHAR(7) NOT NULL,
   source_file VARCHAR(255) NOT NULL,
   ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_property_month_file (property_code, month_year, source_file),
+  UNIQUE KEY uq_property_month (property_code, month_year),
   CONSTRAINT fk_snapshot_property FOREIGN KEY (property_code) REFERENCES properties(property_code)
 );
 
