@@ -1,89 +1,118 @@
-# Property-Scoped AI Chatbot Platform (Architecture Overview)
+# Property-Scoped AI Platform (Architecture Overview)
 
 ## Goal
-Build a chatbot where every answer is constrained to a selected property code (for example `115R`), starting with structured rent-roll data and extending later to unstructured website content.
+Provide property-scoped assistant responses where every request is constrained to one `property_code` (for example `115R`) across both structured SQL and unstructured retrieval paths.
 
-## High-Level Architecture
-1. Frontend UI (later)
-- Sets active `property_code` for session.
-- Renders rich responses (Markdown/HTML + structured UI blocks).
+## Current Architecture
+1. API Layer (FastAPI)
+- Enforces property scope via `X-Property-Code` header and request payload equality.
+- Exposes operational endpoints (`/health`, `/models`, `/chat`, admin endpoints).
 
-2. API Gateway
-- AuthN/AuthZ.
-- Injects `property_code` into request context and signed token.
-- Rejects requests missing property scope.
+2. Orchestration Layer (LangGraph)
+- Graph flow: `route_node -> sql_node -> rag_node -> synth_node` (branching by route).
+- Routes requests to SQL, RAG, or HYBRID.
 
-3. Orchestration Service (LangChain/LangGraph)
-- Model router: runtime LLM switch (`gpt-4.1`, `gpt-4o`, Claude, etc.).
-- Query router: structured SQL path vs unstructured RAG path.
-- Tool execution policy: all tools require property-scoped arguments.
+3. Structured Data Layer (MySQL)
+- Tables:
+  - `properties`
+  - `rent_roll_snapshots`
+  - `rent_roll_units`
+  - `rent_roll_unit_charges`
+- Snapshot uniqueness is enforced by `(property_code, month_year)`.
 
-4. Data Services
-- Structured store (MySQL): rent roll snapshots, units, and charges keyed by property code.
-- Unstructured store (later): chunked docs + vector index with metadata filter `property_code`.
+4. Unstructured Data Layer (Qdrant)
+- Collection: `property_website_chunks`.
+- Retrieval always applies metadata filter `property_code == active_property_code`.
 
-5. Response Composer
+5. Response Layer
 - Returns:
-  - `answer_markdown` or `answer_html`
-  - `ui_blocks` (table, kpi_card, chart_spec, comparison_view)
-  - `citations` and query traces for auditability
+  - `answer_markdown`
+  - `ui_blocks` (KPI cards, tables, optional chart block)
+  - `citations` (SQL provenance and/or RAG source references)
+  - `debug` metadata
 
-## Property Scope Enforcement (End-to-End)
-1. Session-level scope: `property_code` is selected and immutable per chat thread unless explicitly switched.
-2. API-level scope: gateway adds `X-Property-Code` and signed claim.
-3. Orchestrator-level scope: each tool schema includes required `property_code`; middleware validates equality with session scope.
-4. SQL scope: all queries require `WHERE property_code = :active_property_code`.
-5. Vector scope (later): metadata filter `{ property_code: "115R" }` is mandatory.
-6. Audit log: store request_id, property_code, tool calls, and retrieved row/chunk IDs.
+## System Design Diagram
+```mermaid
+flowchart LR
+    U[User / Frontend] --> G[FastAPI]
+    G -->|X-Property-Code + property_code| AG[LangGraph Orchestrator]
 
-## Structured Data Model (MySQL)
-- `properties`
-- `rent_roll_snapshots`
-- `rent_roll_units`
-- `rent_roll_unit_charges`
+    AG --> R[Route Node]
+    R -->|SQL| S[SQL Node]
+    R -->|RAG| V[RAG Node]
+    R -->|HYBRID| S
+    S -->|HYBRID continuation| V
 
-Normalization choice:
-- Keep one unit row per resident/unit snapshot.
-- Store charge lines in child table, including explicit `Total` lines.
-- Supports queries like charge mix, delinquency, expiring leases, and MoM comparisons.
+    S --> M[(MySQL)]
+    V --> Q[(Qdrant)]
+    V --> F[Filter: property_code == active]
 
-## LLM Runtime Switching
-Design:
-- `model_registry` table or config file maps model IDs to provider adapters.
-- Request includes optional `model_id`; default fallback per tenant.
-- Unified prompt+tool schema so switching models does not break tool contracts.
-
-Tradeoff:
-- Better flexibility and A/B testing.
-- Requires strict output normalization because providers differ in tool-calling behavior.
-
-## Rich Response Contract
-Use a typed response envelope:
-```json
-{
-  "property_code": "115R",
-  "answer_markdown": "...",
-  "ui_blocks": [
-    {"type":"kpi_card","title":"Occupancy","value":"94.2%"},
-    {"type":"table","columns":["Unit","Balance"],"rows":[["A103",71.35]]}
-  ],
-  "citations": []
-}
+    S --> Y[Synthesis Node]
+    V --> Y
+    Y --> O[answer_markdown + ui_blocks + citations]
+    O --> U
 ```
-This keeps frontend rendering deterministic and model-agnostic.
 
-## Assumptions
-- Source files are monthly snapshots per property.
-- Existing files are `.xls` extension but OpenXML content.
-- PII handling/redaction policy will be defined before production release.
+## Property Scope Enforcement
+1. API scope check:
+- `X-Property-Code` must match request `property_code`; mismatch returns HTTP `403`.
 
-## Limitations (Current Phase)
-- No unstructured ingestion yet.
-- No frontend yet.
-- Loader currently expects stable report layout.
+2. SQL scope check:
+- Deterministic SQL templates always include scoped property filters.
+- Generated SQL must pass validation including bound `:property_code` on a real table alias.
 
-## Next Step to Add RAG
-1. Define unstructured document schema with `property_code`, `source_url`, `chunk_id`.
-2. Build crawler/extractor for company site content.
-3. Embed chunks and enforce metadata filtering in retrieval.
-4. Extend query router confidence logic to combine SQL+RAG when needed.
+3. RAG scope check:
+- Qdrant query filter requires matching `property_code`.
+
+## SQL Path Design (Hybrid)
+The SQL path is intentionally hybrid:
+1. Deterministic templates for common intents (KPI, occupancy, vacancies, highest balances, unit details/fields, deposits, charges, lease expirations).
+2. Governed LLM-to-SQL fallback for flexible structured questions.
+3. Validation + repair loop (up to 3 attempts) before execution.
+
+### SQL Guardrails
+Generated SQL is rejected unless all checks pass:
+- `SELECT` only
+- no DML/DDL keywords
+- no comments or semicolon chaining
+- no `SELECT *`
+- allowlisted tables/columns only
+- required bound `:property_code` filter
+- no hard-coded property values
+- no system schema access
+- required `LIMIT` for row-returning queries (capped)
+
+### SQL Provenance
+SQL results add citation metadata:
+- `source_type=sql`
+- `property_code`
+- `period_applied`
+- `query_source` (`template`, `llm_generated_validated`, or `none`)
+- `sql_kind`
+- `row_count`
+
+## RAG Path Design
+- Embedding provider is configurable (`google` or `ollama`).
+- Retrieved snippets are deduplicated and returned with source citation metadata.
+
+## Model Runtime Support (Current)
+The currently supported model prefixes in runtime are:
+- `gemini*`
+- `grok*`
+- `gpt*`
+
+Model options are exposed via `/models` from `MODEL_REGISTRY`.
+
+## Ingestion Design
+- Ingestion endpoint: `POST /admin/ingest?mode=skip_existing|reload`.
+- Source files are parsed from the mounted data directory.
+- `reload` replaces month snapshot unit/charge rows; `skip_existing` keeps already-loaded month snapshots.
+
+## Operational Notes
+- `/properties/{property_code}/kpis` is scoped to latest snapshot month for that property.
+- Trace logging path is configurable by `TRACE_LOG_PATH` and defaults to `logs/traces.jsonl`.
+- For existing databases created with old uniqueness rules, apply `sql/003_snapshot_uniqueness_migration.sql`.
+
+## Known Limitations
+- RAG answer quality depends on crawl/index quality and embedding coverage.
+- End-to-end behavior depends on valid API keys and running MySQL/Qdrant services.
